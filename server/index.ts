@@ -1,7 +1,8 @@
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
-import "./telegram/bot"; // Import the bot to ensure it's initialized
+import { Connection } from '@solana/web3.js';
+import { initializeBot } from './telegram/bot';
 
 const app = express();
 app.use(express.json());
@@ -54,12 +55,30 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  const port = 5000;
-  server.listen({
-    port,
-    host: "0.0.0.0",
-    reusePort: true,
-  }, () => {
-    log(`serving on port ${port}`);
-  });
+  const port = process.env.PORT || 5000;
+
+  async function startServer() {
+    try {
+      console.log('Starting server...');
+      
+      // Initialize bot first
+      const connection = new Connection('https://api.mainnet-beta.solana.com');
+      const bot = await initializeBot(connection);
+      console.log('Bot initialized');
+
+      // Start express server
+      server.listen({
+        port,
+        host: "0.0.0.0",
+        reusePort: true,
+      }, () => {
+        log(`serving on port ${port}`);
+      });
+    } catch (error) {
+      console.error('Server startup error:', error);
+      process.exit(1);
+    }
+  }
+
+  startServer();
 })();
