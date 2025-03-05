@@ -2,6 +2,8 @@
 
 ### 1. System Architecture
 
+![System Architecture](https://raw.githubusercontent.com/svgvr8/telegram-channel/refs/heads/main/arch.png)
+
 #### 1.1 Core Components
 - **Express Server**: Main application server
 - **Telegram Bot**: Automated messaging and trading system
