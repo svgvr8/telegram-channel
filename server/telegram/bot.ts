@@ -12,6 +12,7 @@ import {
   createApproveInstruction
 } from '@solana/spl-token';
 import { scheduleJob } from 'node-schedule';
+import { ChannelManager } from './channel';
 
 dotenv.config();
 
@@ -763,56 +764,64 @@ export async function initializeBot(connection: Connection): Promise<Telegraf<Co
   console.log('🤖 Bot Starting...');
   
   const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN!);
-  const CHANNEL_ID = process.env.CHANNEL_ID || '-1002476351876';
+  const channelManager = new ChannelManager(process.env.CHANNEL_ID || '-1002476351876');
 
-  // Simple periodic message function
-  async function sendMessage() {
-    try {
-      const message = `🚀 PumpScience Bot Test
-      
-Time: ${new Date().toLocaleString()}
-Test ID: ${Math.floor(Math.random() * 1000)}`;
+  try {
+    // Configure bot to use webhooks instead of polling
+    bot.telegram.deleteWebhook(); // Clear any existing webhooks
+    
+    console.log('Starting bot in polling mode...');
+    
+    // Initialize bot without launching
+    const botInfo = await bot.telegram.getMe();
+    console.log('Bot info:', {
+      id: botInfo.id,
+      username: botInfo.username,
+      firstName: botInfo.first_name
+    });
 
-      console.log('Sending message to channel:', CHANNEL_ID);
-      await bot.telegram.sendMessage(CHANNEL_ID, message);
-      console.log('Message sent successfully');
-    } catch (error) {
-      console.error('Failed to send message:', error);
-    }
+    // Start periodic messages without launching bot
+    await channelManager.startPeriodicMessages(bot);
+
+    // Add command handlers
+    bot.command('startmessages', async (ctx) => {
+      try {
+        await channelManager.startPeriodicMessages(bot);
+        await ctx.reply('✅ Periodic messages started');
+      } catch (error) {
+        console.error('Failed to start messages:', error);
+        await ctx.reply('❌ Failed to start messages');
+      }
+    });
+
+    bot.command('stopmessages', async (ctx) => {
+      try {
+        channelManager.stopPeriodicMessages();
+        await ctx.reply('✅ Periodic messages stopped');
+      } catch (error) {
+        console.error('Failed to stop messages:', error);
+        await ctx.reply('❌ Failed to stop messages');
+      }
+    });
+
+    // Handle graceful shutdown
+    const shutdown = () => {
+      console.log('Shutting down bot...');
+      channelManager.stopPeriodicMessages();
+      bot.stop('SIGTERM');
+    };
+
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+
+    console.log('✅ Bot initialized successfully');
+    return bot;
+
+  } catch (error) {
+    console.error('❌ Bot initialization failed:', error);
+    throw error;
   }
-
-  // Send immediate test message
-  console.log('Sending initial test message...');
-  await sendMessage();
-
-  // Set up interval (every 60 seconds)
-  setInterval(sendMessage, 60000);
-
-  console.log('Bot initialized successfully');
-  return bot;
 }
-
-// Function to stop periodic messages
-function stopPeriodicMessages() {
-  if (messageInterval) {
-    clearInterval(messageInterval);
-    messageInterval = null;
-    console.log('⏹️ Periodic messages stopped');
-  }
-}
-
-// Add graceful shutdown handler
-process.on('SIGINT', () => {
-  console.log('\n👋 Gracefully shutting down...');
-  stopPeriodicMessages();
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  console.log('\n👋 Gracefully shutting down...');
-  stopPeriodicMessages();
-  process.exit(0);
-});
 
 if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");

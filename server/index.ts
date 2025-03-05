@@ -61,24 +61,38 @@ app.use((req, res, next) => {
     try {
       console.log('Starting server...');
       
-      // Initialize bot first
+      // Initialize Solana connection
       const connection = new Connection('https://api.mainnet-beta.solana.com');
+      
+      // Initialize bot
       const bot = await initializeBot(connection);
       console.log('Bot initialized');
 
       // Start express server
-      server.listen({
-        port,
-        host: "0.0.0.0",
-        reusePort: true,
-      }, () => {
-        log(`serving on port ${port}`);
+      server.listen(port, () => {
+        console.log(`Server running on port ${port}`);
       });
+
+      // Handle process termination
+      const shutdown = async () => {
+        console.log('Shutting down server...');
+        try {
+          await bot.stop();
+          process.exit(0);
+        } catch (error) {
+          console.error('Error during shutdown:', error);
+          process.exit(1);
+        }
+      };
+
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+
     } catch (error) {
       console.error('Server startup error:', error);
       process.exit(1);
     }
   }
 
-  startServer();
+  startServer().catch(console.error);
 })();

@@ -1,64 +1,121 @@
 import { Context, Telegraf } from 'telegraf';
+import nodeHtmlToImage from 'node-html-to-image';
+import { getRifCardHTML } from '../templates/rifCard';
 
-// Constants
-const CHANNEL_ID = process.env.CHANNEL_ID || '-1002476351876';
-let messageCount = 0;
+export class ChannelManager {
+  private channelId: string;
+  private messageCount: number;
+  private messageInterval: NodeJS.Timeout | null;
+  private isLongCard: boolean; // Track which image to show
 
-export async function sendChannelMessage(bot: Telegraf<Context>) {
-  try {
-    messageCount++;
-    const timestamp = new Date().toLocaleString();
-
-    const message = `🚀 PumpScience Update #${messageCount}
-    
-💹 Market Activity:
-• 24h Volume: $${(Math.random() * 1000000).toFixed(2)}
-• Active Traders: ${Math.floor(Math.random() * 1000)}
-
-📊 Recent Performance:
-• Trades Executed: ${Math.floor(Math.random() * 100)}
-• Success Rate: ${(Math.random() * 20 + 80).toFixed(1)}%
-
-⏰ ${timestamp}`;
-
-    console.log('📤 Sending message to channel:', {
-      channelId: CHANNEL_ID,
-      messageNumber: messageCount,
-      timestamp
-    });
-
-    const result = await bot.telegram.sendMessage(CHANNEL_ID, message);
-    
-    console.log('✅ Message sent successfully:', {
-      messageId: result.message_id,
-      messageNumber: messageCount,
-      timestamp
-    });
-
-    return result;
-  } catch (error) {
-    console.error('❌ Channel message error:', {
-      error: error.message,
-      channelId: CHANNEL_ID,
-      messageNumber: messageCount
-    });
-    throw error;
+  constructor(channelId: string) {
+    this.channelId = channelId;
+    this.messageCount = 0;
+    this.messageInterval = null;
+    this.isLongCard = true; // Start with the long card
   }
-}
 
-export function startPeriodicMessages(bot: Telegraf<Context>) {
-  console.log('🚀 Starting periodic channel messages');
+  private async generateCardImage(isLongCard: boolean) {
+    const data = {
+      price: '$0.00042',
+      marketCap: '$3.5M',
+      change24h: '32.87'
+    };
 
-  // Send first message immediately
-  sendChannelMessage(bot)
-    .catch(error => console.error('Initial message failed:', error));
+    const html = getRifCardHTML(data);
+    
+    const image = await nodeHtmlToImage({
+      html,
+      quality: 100,
+      type: 'png',
+      puppeteerArgs: {
+        args: ['--no-sandbox']
+      },
+      selector: '.card'
+    });
 
-  // Set up interval for periodic messages
-  const interval = setInterval(() => {
-    sendChannelMessage(bot)
-      .catch(error => console.error('Periodic message failed:', error));
-  }, 60000);
+    return image;
+  }
 
-  // Return interval for cleanup
-  return interval;
+  async sendPeriodicMessage(bot: Telegraf<Context>) {
+    try {
+      this.messageCount++;
+
+      // Generate card image
+      const cardImage = await this.generateCardImage(this.isLongCard);
+
+      const message = await bot.telegram.sendPhoto(this.channelId, {
+        source: cardImage as Buffer
+      }, {
+        caption: '💊 Rifampicin ($RIF)\nA Life Extension Token on Wormhole',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '🌐 RIF on Pump.Science',
+                url: 'https://pump.science/experiments/RIF?mint=GJtJuWD9qYcCkrwMBmtY1tpapV1sKfB2zUv9Q4aqpump'              }
+            ],
+            [
+              {
+                text: '📊 RIF on Telegram',
+                url: 'https://t.me/newspumpsciencebot?start=buy_GJtJuWD9qYcCkrwMBmtY1tpapV1sKfB2zUv9Q4aqpump'              }
+            ]
+          ]
+        }
+      });
+
+      // Toggle for next message
+      this.isLongCard = !this.isLongCard;
+
+      console.log('✅ Message sent successfully:', {
+        messageId: message.message_id,
+        messageCount: this.messageCount,
+        imageType: this.isLongCard ? 'long card' : 'short card',
+        timestamp: new Date().toISOString()
+      });
+
+    } catch (error) {
+      console.error('❌ Error sending message:', {
+        messageCount: this.messageCount,
+        channelId: this.channelId,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+
+  async startPeriodicMessages(bot: Telegraf<Context>) {
+    if (this.messageInterval) {
+      clearInterval(this.messageInterval);
+    }
+
+    console.log('🚀 Starting periodic messages...');
+    
+    try {
+      // Send first message immediately
+      await this.sendPeriodicMessage(bot);
+      
+      // Set up interval for subsequent messages
+      this.messageInterval = setInterval(async () => {
+        try {
+          await this.sendPeriodicMessage(bot);
+        } catch (error) {
+          console.error('❌ Interval message error:', error);
+        }
+      }, 60000);
+
+      console.log('⏰ Message interval set to 60 seconds');
+    } catch (error) {
+      console.error('❌ Failed to start periodic messages:', error);
+      throw error;
+    }
+  }
+
+  stopPeriodicMessages() {
+    if (this.messageInterval) {
+      clearInterval(this.messageInterval);
+      this.messageInterval = null;
+      console.log('⏹️ Periodic messages stopped');
+    }
+  }
 } 
