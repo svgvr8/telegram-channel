@@ -1,6 +1,6 @@
 import { Connection, PublicKey, Keypair, VersionedTransaction, Transaction, SystemProgram, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import { Telegraf, Context } from "telegraf";
-import LocalSession from "telegraf-session-local";
+import LocalSession from 'telegraf-session-local';
 import { log } from "../vite";
 import type { BotContext } from "./types";
 import dotenv from "dotenv";
@@ -132,7 +132,13 @@ function toTokenAmount(amount: number, decimals: number = 9): bigint {
   return BigInt(Math.floor(amount * Math.pow(10, decimals)));
 }
 
-// Update the getJupiterQuote function
+// First, let's define our token constants clearly
+const TOKENS = {
+  SOL: 'So11111111111111111111111111111111111111112',
+  USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+} as const;
+
+// Update the getJupiterQuote function to validate parameters
 async function getJupiterQuote(params: {
   inputMint: string;
   outputMint: string;
@@ -142,18 +148,29 @@ async function getJupiterQuote(params: {
   platformFeeBps?: string;
   computeUnitPriceMicroLamports?: string;
 }) {
+  // Validate required parameters
+  if (!params.inputMint || !params.outputMint || !params.amount) {
+    throw new Error('Missing required parameters for quote: inputMint, outputMint, or amount');
+  }
+
   const queryParams = new URLSearchParams({
     inputMint: params.inputMint,
     outputMint: params.outputMint,
     amount: params.amount,
     slippageBps: params.slippageBps || '50',
     onlyDirectRoutes: (params.onlyDirectRoutes || false).toString(),
-    platformFeeBps: params.platformFeeBps || '0',
+    platformFeeBps: params.platformFeeBps || '0'
   });
 
   if (params.computeUnitPriceMicroLamports) {
     queryParams.append('computeUnitPriceMicroLamports', params.computeUnitPriceMicroLamports);
   }
+
+  console.log('Quote Request Parameters:', {
+    inputMint: params.inputMint,
+    outputMint: params.outputMint,
+    amount: params.amount
+  });
 
   const url = `https://public.jupiterapi.com/quote?${queryParams.toString()}`;
   console.log('Jupiter Quote Request:', url);
@@ -827,18 +844,77 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN environment variable is required");
 }
 
+// Initialize session with proper configuration
+const session = new LocalSession({
+  database: 'sessions.json',
+  property: 'session',
+  storage: LocalSession.storageFileSync,
+  format: {
+    serialize: (obj) => JSON.stringify(obj, null, 2),
+    deserialize: (str) => JSON.parse(str),
+  },
+  state: { }
+});
+
 const bot = new Telegraf<BotContext>(process.env.TELEGRAM_BOT_TOKEN);
-bot.use((new LocalSession({ database: 'sessions.json' })).middleware());
+bot.use(session.middleware());
+
+// Helper function to get or create wallet
+async function getOrCreateWallet(ctx: BotContext) {
+  const userId = ctx.from?.id.toString();
+  if (!userId) return null;
+
+  if (!ctx.session.wallet) {
+    // Try to load existing wallet from storage
+    const existingWallet = await session.getSession(`${userId}`);
+    
+    if (existingWallet?.wallet) {
+      ctx.session.wallet = existingWallet.wallet;
+    } else {
+      // Create new wallet only if one doesn't exist
+      const wallet = Keypair.generate();
+      ctx.session.wallet = {
+        publicKey: wallet.publicKey.toString(),
+        secretKey: Buffer.from(wallet.secretKey).toString('hex')
+      };
+      // Save the new wallet
+      await session.saveSession(`${userId}`, ctx.session);
+    }
+  }
+  
+  return ctx.session.wallet;
+}
 
 bot.command('start', async (ctx) => {
   try {
     const startParam = ctx.message?.text?.substring(7);
+    const userId = ctx.from?.id.toString();
+
+    // First check if user already has a wallet in session
+    if (!ctx.session.wallet && userId) {
+      // Try to load existing wallet from storage
+      const existingWallet = await session.getSession(`${userId}`);
+      
+      if (existingWallet?.wallet) {
+        ctx.session.wallet = existingWallet.wallet;
+      } else {
+        // Create new wallet only if one doesn't exist
+        const wallet = Keypair.generate();
+        ctx.session.wallet = {
+          publicKey: wallet.publicKey.toString(),
+          secretKey: Buffer.from(wallet.secretKey).toString('hex')
+        };
+        // Save the new wallet
+        await session.saveSession(`${userId}`, ctx.session);
+      }
+    }
 
     if (startParam) {
       const [action, address] = startParam.split('_');
       if (address && (action === 'buy' || action === 'sell')) {
-        ctx.session = { tokenAddress: address };
-
+        // Only update token address, keep existing wallet
+        ctx.session.tokenAddress = address;
+        
         const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
         const data = await response.json();
 
@@ -860,30 +936,8 @@ bot.command('start', async (ctx) => {
         } else {
           await ctx.reply(formatTokenNotFoundError(address), { parse_mode: 'Markdown' });
         }
-      } else {
-        if (!ctx.session.wallet) {
-          const wallet = Keypair.generate();
-          ctx.session.wallet = {
-            publicKey: wallet.publicKey.toString(),
-            secretKey: Buffer.from(wallet.secretKey).toString('hex')
-          };
-        }
-
-        const startupMessage = formatStartupWalletInfo(ctx.session.wallet.publicKey);
-        await ctx.reply(startupMessage, {
-          parse_mode: 'Markdown',
-          reply_markup: getMainMenuButtons()
-        });
       }
     } else {
-      if (!ctx.session.wallet) {
-        const wallet = Keypair.generate();
-        ctx.session.wallet = {
-          publicKey: wallet.publicKey.toString(),
-          secretKey: Buffer.from(wallet.secretKey).toString('hex')
-        };
-      }
-
       const startupMessage = formatStartupWalletInfo(ctx.session.wallet.publicKey);
       await ctx.reply(startupMessage, {
         parse_mode: 'Markdown',
@@ -895,22 +949,68 @@ bot.command('start', async (ctx) => {
   }
 });
 
-bot.action('buy', async (ctx: BotContext) => {
+// Helper function for consistent log formatting
+function logDebug(context: string, data: any) {
+  console.log(`🔍 [${context}]:`, JSON.stringify(data, null, 2));
+}
+
+// Buy action handler
+bot.action('buy', async (ctx) => {
   try {
+    logDebug('BUY_START', {
+      userId: ctx.from?.id,
+      timestamp: new Date().toISOString()
+    });
+
     await ctx.answerCbQuery();
+    
+    // Log session state
+    logDebug('SESSION_STATE', {
+      hasWallet: !!ctx.session.wallet,
+      sessionData: ctx.session
+    });
 
     if (!ctx.session.wallet) {
+      logDebug('WALLET_MISSING', {
+        creatingNew: true,
+        userId: ctx.from?.id
+      });
+
       const wallet = Keypair.generate();
       ctx.session.wallet = {
         publicKey: wallet.publicKey.toString(),
         secretKey: Buffer.from(wallet.secretKey).toString('hex')
       };
+
+      logDebug('WALLET_CREATED', {
+        publicKey: ctx.session.wallet.publicKey,
+        userId: ctx.from?.id
+      });
     }
 
     const publicKey = new PublicKey(ctx.session.wallet.publicKey);
+    
+    logDebug('CHECKING_BALANCE', {
+      wallet: publicKey.toString(),
+      timestamp: new Date().toISOString()
+    });
+
     const balance = await connection.getBalance(publicKey);
+    
+    logDebug('BALANCE_RESULT', {
+      wallet: publicKey.toString(),
+      balanceSOL: balance / LAMPORTS_PER_SOL,
+      balanceLamports: balance,
+      timestamp: new Date().toISOString()
+    });
 
     if (balance <= 0) {
+      logDebug('INSUFFICIENT_BALANCE', {
+        wallet: publicKey.toString(),
+        balance: balance,
+        minimumRequired: LAMPORTS_PER_SOL * 0.001 // Example minimum
+      });
+
       await ctx.reply(formatInsufficientBalanceMessage(balance, ctx.session.wallet.publicKey),
         { parse_mode: 'Markdown' });
       return;
@@ -919,35 +1019,55 @@ bot.action('buy', async (ctx: BotContext) => {
     const message = formatWalletInfo(balance, ctx.session.wallet.publicKey) + `
 📝 Please enter the token contract address to buy`;
 
+    logDebug('PROMPTING_TOKEN_ADDRESS', {
+      wallet: publicKey.toString(),
+      balance: balance / LAMPORTS_PER_SOL,
+      timestamp: new Date().toISOString()
+    });
+
     await ctx.reply(message, { parse_mode: 'Markdown' });
     ctx.session.lastAction = 'buy';
+
+    logDebug('BUY_ACTION_COMPLETE', {
+      wallet: publicKey.toString(),
+      sessionUpdated: true,
+      lastAction: ctx.session.lastAction
+    });
+
   } catch (error) {
+    logDebug('BUY_ACTION_ERROR', {
+      error: {
+        message: error.message,
+        stack: error.stack,
+        name: error.name
+      },
+      sessionState: ctx.session
+    });
+    
     log(`Error in buy action: ${error}`, "telegram");
     await ctx.reply('❌ Error checking wallet balance. Please try again - Pump Science Wallet');
   }
 });
 
-bot.action('sell', async (ctx: BotContext) => {
+bot.action('sell', async (ctx) => {
   try {
     await ctx.answerCbQuery();
-
-    if (!ctx.session.wallet) {
-      const wallet = Keypair.generate();
-      ctx.session.wallet = {
-        publicKey: wallet.publicKey.toString(),
-        secretKey: Buffer.from(wallet.secretKey).toString('hex')
-      };
-    }
-
-    const publicKey = new PublicKey(ctx.session.wallet.publicKey);
-    const balance = await connection.getBalance(publicKey);
-
-    if (balance <= 0) {
-      await ctx.reply(formatInsufficientBalanceMessage(balance, ctx.session.wallet.publicKey), { parse_mode: 'Markdown' });
+    
+    const wallet = await getOrCreateWallet(ctx);
+    if (!wallet) {
+      await ctx.reply('❌ Error accessing wallet. Please try again.');
       return;
     }
 
-    const message = formatWalletInfo(balance, ctx.session.wallet.publicKey) + `
+    const publicKey = new PublicKey(wallet.publicKey);
+    const balance = await connection.getBalance(publicKey);
+
+    if (balance <= 0) {
+      await ctx.reply(formatInsufficientBalanceMessage(balance, wallet.publicKey), { parse_mode: 'Markdown' });
+      return;
+    }
+
+    const message = formatWalletInfo(balance, wallet.publicKey) + `
 📝 Please enter the token contract address to sell`;
 
     await ctx.reply(message, { parse_mode: 'Markdown' });
@@ -962,21 +1082,19 @@ bot.action('my_wallet', async (ctx) => {
   try {
     await ctx.answerCbQuery();
 
-    if (!ctx.session.wallet) {
-      const wallet = Keypair.generate();
-      ctx.session.wallet = {
-        publicKey: wallet.publicKey.toString(),
-        secretKey: Buffer.from(wallet.secretKey).toString('hex')
-      };
+    const wallet = await getOrCreateWallet(ctx);
+    if (!wallet) {
+      await ctx.reply('❌ Error accessing wallet. Please try again.');
+      return;
     }
 
-    const publicKey = new PublicKey(ctx.session.wallet.publicKey);
+    const publicKey = new PublicKey(wallet.publicKey);
     const balance = await connection.getBalance(publicKey);
 
     const message = `
 👛 Pump Science Wallet
 
-${formatWalletInfo(balance, ctx.session.wallet.publicKey)}
+${formatWalletInfo(balance, wallet.publicKey)}
 
 📝 Note: Copy your wallet address above to deposit funds.`;
 
@@ -989,14 +1107,25 @@ ${formatWalletInfo(balance, ctx.session.wallet.publicKey)}
 
 bot.action(/^confirm_trade:(.+)$/, async (ctx) => {
   try {
+    logDebug('TRADE_CONFIRMATION_START', {
+      userId: ctx.from?.id,
+      sessionState: ctx.session
+    });
+
     await ctx.answerCbQuery();
     
     if (!ctx.session?.wallet) {
+      logDebug('WALLET_MISSING_AT_CONFIRMATION', {
+        userId: ctx.from?.id
+      });
       await ctx.reply('❌ Wallet not found. Please restart the bot with /start');
       return;
     }
 
     if (!ctx.session?.tradeAmount) {
+      logDebug('TRADE_AMOUNT_MISSING', {
+        sessionState: ctx.session
+      });
       await ctx.reply('❌ Trade amount not found. Please try again');
       return;
     }
@@ -1005,41 +1134,45 @@ bot.action(/^confirm_trade:(.+)$/, async (ctx) => {
       Buffer.from(ctx.session.wallet.secretKey, 'hex')
     );
 
-    const isSell = ctx.session.lastAction === 'sell';
-    try {
-      const txid = await executeJupiterTrade(
-        userWallet,
-        isSell ? ctx.session.tokenAddress! : 'So11111111111111111111111111111111111111112',
-        isSell ? 'So11111111111111111111111111111111111111112' : ctx.session.tokenAddress!,
-        ctx.session.tradeAmount,
-        isSell
-      );
+    logDebug('EXECUTING_TRADE', {
+      wallet: userWallet.publicKey.toString(),
+      amount: ctx.session.tradeAmount,
+      tokenAddress: ctx.session.tokenAddress
+    });
 
-      await ctx.reply(
-        `✅ Trade executed successfully!\n\n` +
-        `View on Solscan: https://solscan.io/tx/${txid}`
-      );
-    } catch (error) {
-      let errorMessage = '❌ Trade failed. Please try again.';
+    const txid = await executeJupiterTrade(
+      userWallet,
+      TOKENS.SOL,
+      ctx.session.tokenAddress,
+      ctx.session.tradeAmount,
+      false
+    );
 
-      if (error.message.includes('INSUFFICIENT_BALANCE')) {
-        errorMessage = isSell 
-          ? '❌ Insufficient token balance for the trade.'
-          : '❌ Insufficient SOL balance for the trade.';
-      } else if (error.message.includes('TOKEN_APPROVAL_FAILED')) {
-        errorMessage = '❌ Failed to approve token spending. Please try again.';
-      } else if (error.message.includes('SWAP_ERROR')) {
-        errorMessage = '❌ Swap failed. This could be due to price movement or insufficient liquidity.';
-      } else if (error.message.includes('SIMULATION_FAILED')) {
-        errorMessage = '❌ Transaction simulation failed. Please try a different amount.';
-      }
+    logDebug('TRADE_EXECUTED', {
+      txid,
+      wallet: userWallet.publicKey.toString(),
+      success: true
+    });
 
-      console.error('Detailed error:', error);
-      await ctx.reply(errorMessage);
-    }
+    await ctx.reply(
+      formatSuccessfulTrade(txid, userWallet.publicKey.toString(), ctx.session.tradeAmount)
+    );
+
   } catch (error) {
-    console.error('Confirm trade error:', error);
-    await ctx.reply('❌ An unexpected error occurred');
+    logDebug('TRADE_EXECUTION_ERROR', {
+      error: {
+        message: error.message,
+        stack: error.stack
+      },
+      sessionState: ctx.session
+    });
+
+    let errorMessage = '❌ Trade failed. Please try again.';
+    if (error.message.includes('INSUFFICIENT_BALANCE')) {
+      errorMessage = '❌ Insufficient SOL balance for the trade.';
+    }
+
+    await ctx.reply(errorMessage);
   }
 });
 
@@ -1135,136 +1268,178 @@ bot.action(['sell_50', 'sell_100'], async (ctx) => {
   }
 });
 
+// Text handler with enhanced logging
 bot.on('text', async (ctx) => {
   const text = ctx.message?.text;
   if (!text) return;
 
-  if (!ctx.session.wallet) {
-    const wallet = Keypair.generate();
-    ctx.session.wallet = {
-      publicKey: wallet.publicKey.toString(),
-      secretKey: Buffer.from(wallet.secretKey).toString('hex')
-    };
-  }
+  logDebug('TEXT_INPUT_RECEIVED', {
+    text: text,
+    userId: ctx.from?.id,
+    fullSessionState: ctx.session, // Log the entire session
+    timestamp: new Date().toISOString()
+  });
 
-  // Check if this is a SOL amount input for trading
+  // Amount handling - Check this condition first
   if (ctx.session.tokenAddress && !isNaN(parseFloat(text))) {
     const amount = parseFloat(text);
     
-    // Store the amount in the session
-    ctx.session.tradeAmount = amount;
-
-    // Get wallet balance
-    const publicKey = new PublicKey(ctx.session.wallet.publicKey);
-    const balance = await connection.getBalance(publicKey);
-
-    if (balance <= 0) {
-      await ctx.reply(formatInsufficientBalanceMessage(balance, ctx.session.wallet.publicKey), { parse_mode: 'Markdown' });
-      return;
-    }
-
-    // Check if amount is greater than balance
-    if (amount * LAMPORTS_PER_SOL > balance) {
-      await ctx.reply(
-        formatTradeErrorMessage(balance, amount, ctx.session.wallet.publicKey),
-        { parse_mode: 'Markdown' }
-      );
-      return;
-    }
+    logDebug('AMOUNT_INPUT_DETECTED', {
+      inputText: text,
+      parsedAmount: amount,
+      tokenAddress: ctx.session.tokenAddress,
+      sessionState: ctx.session
+    });
 
     try {
-      // Validate token address
-      try {
-        new PublicKey(ctx.session.tokenAddress);
-      } catch (e) {
-        await ctx.reply(formatInvalidAddressError(), { parse_mode: 'Markdown' });
+      // Check wallet balance
+      const wallet = new PublicKey(ctx.session.wallet.publicKey);
+      const balance = await connection.getBalance(wallet);
+      
+      logDebug('CHECKING_BALANCE_FOR_TRADE', {
+        wallet: wallet.toString(),
+        balance: balance / LAMPORTS_PER_SOL,
+        requestedAmount: amount,
+        sufficient: balance >= amount * LAMPORTS_PER_SOL
+      });
+
+      if (balance < amount * LAMPORTS_PER_SOL) {
+        logDebug('INSUFFICIENT_BALANCE_FOR_TRADE', {
+          balance: balance / LAMPORTS_PER_SOL,
+          requested: amount,
+          difference: (amount * LAMPORTS_PER_SOL - balance) / LAMPORTS_PER_SOL
+        });
+        
+        await ctx.reply(
+          formatTradeErrorMessage(balance, amount, ctx.session.wallet.publicKey),
+          { parse_mode: 'Markdown' }
+        );
         return;
       }
 
-      const quote = await getJupiterQuote(
-        "So11111111111111111111111111111111111111112", // SOL mint
-        ctx.session.tokenAddress,
-        amount
-      );
+      // Prepare quote request
+      const quoteParams = {
+        inputMint: TOKENS.SOL,
+        outputMint: ctx.session.tokenAddress,
+        amount: (amount * LAMPORTS_PER_SOL).toString(),
+        slippageBps: '100',
+        onlyDirectRoutes: false
+      };
 
-      const preConfirmationMessage = formatTradeSummary(
-        amount,
-        Number(quote.outAmount) / LAMPORTS_PER_SOL,
-        quote.priceImpactPct || 0,
-        Number(quote.otherAmountThreshold || 0) / LAMPORTS_PER_SOL,
-        balance
-      );
-
-      await ctx.reply(preConfirmationMessage, {
-        parse_mode: 'Markdown',
-        reply_markup: getConfirmationButtons(quote.quoteMeta?.id || 'default')
+      logDebug('REQUESTING_QUOTE', {
+        ...quoteParams,
+        timestamp: new Date().toISOString()
       });
+
+      // Get quote
+      const quote = await getJupiterQuote(quoteParams);
+      
+      logDebug('QUOTE_RECEIVED', {
+        quote,
+        inputAmount: amount,
+        outputAmount: Number(quote.outAmount) / 1e9,
+        priceImpact: quote.priceImpactPct
+      });
+
+      // Store trade amount
+      ctx.session.tradeAmount = amount;
+      
+      logDebug('TRADE_AMOUNT_STORED', {
+        amount,
+        sessionState: ctx.session
+      });
+
+      // Format confirmation message
+      const message = formatTradeSummary(
+        amount,
+        Number(quote.outAmount) / 1e9,
+        quote.priceImpactPct,
+        Number(quote.otherAmountThreshold) / 1e9,
+        balance,
+        false
+      );
+
+      logDebug('SENDING_CONFIRMATION', {
+        message,
+        quoteId: quote.quoteMeta?.id
+      });
+
+      // Send confirmation message
+      await ctx.reply(message, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Confirm', callback_data: `confirm_trade:${quote.quoteMeta?.id || 'default'}` },
+            { text: '❌ Cancel', callback_data: 'cancel_trade' }
+          ]]
+        }
+      });
+
     } catch (error) {
-      logTradeError(error, 'quote_fetch');
-      await ctx.reply(formatQuoteError(error), { parse_mode: 'Markdown' });
+      logDebug('TRADE_QUOTE_ERROR', {
+        error: {
+          message: error.message,
+          stack: error.stack
+        },
+        amount,
+        tokenAddress: ctx.session.tokenAddress,
+        sessionState: ctx.session
+      });
+
+      await ctx.reply('❌ Error calculating trade quote. Please try again.', { parse_mode: 'Markdown' });
     }
-    return;
-  } else if (text.length >= 32 && text.length <= 44) {
+  }
+  // Token address handling
+  else if (!ctx.session.tokenAddress && text.length >= 32 && text.length <= 44) {
     try {
-      // Validate token address first
+      logDebug('VALIDATING_TOKEN_ADDRESS', {
+        address: text,
+        timestamp: new Date().toISOString()
+      });
+
+      // Validate token address
       try {
         new PublicKey(text);
       } catch (e) {
-        await ctx.reply(formatInvalidAddressError(), { parse_mode: 'Markdown' });
+        logDebug('INVALID_TOKEN_ADDRESS', {
+          address: text,
+          error: e.message
+        });
+        await ctx.reply('❌ Invalid token address. Please enter a valid Solana token address.', { parse_mode: 'Markdown' });
         return;
       }
 
-      const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${text}`);
+      // Store token address and request amount
+      ctx.session.tokenAddress = text;
+      ctx.session.lastAction = 'buy'; // Make sure we set this
+      
+      logDebug('TOKEN_ADDRESS_STORED', {
+        address: text,
+        sessionState: ctx.session
+      });
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      if (data.pairs && data.pairs.length > 0) {
-        const pair = data.pairs[0];
-        const message = formatTokenInfo(pair, text);
-        ctx.session.tokenAddress = text;
-
-        if (ctx.session.lastAction === 'sell') {
-          await ctx.reply(message, {
-            parse_mode: 'Markdown',
-            reply_markup: getTradeButtons(true, text)
-          });
-        } else {
-          await ctx.reply(message, {
-            parse_mode: 'Markdown',
-            reply_markup: getTradeButtons(false, text)
-          });
-        }
-      } else {
-        await ctx.reply(formatTokenNotFoundError(text), { parse_mode: 'Markdown' });
-      }
+      await ctx.reply('💰 Please enter the amount in SOL you want to spend:', { parse_mode: 'Markdown' });
     } catch (error) {
-      logTradeError(error, 'token_info_fetch');
-      await ctx.reply(formatApiError(), { parse_mode: 'Markdown' });
+      logDebug('TOKEN_PROCESSING_ERROR', {
+        error: {
+          message: error.message,
+          stack: error.stack
+        },
+        address: text,
+        sessionState: ctx.session
+      });
+      
+      await ctx.reply('❌ Error processing token address. Please try again.', { parse_mode: 'Markdown' });
     }
   } else {
-    await ctx.reply(formatInvalidAddressError(), { parse_mode: 'Markdown' });
-  }
-});
-
-bot.action(/^enter_amount:(.+)$/, async (ctx) => {
-  try {
-    await ctx.answerCbQuery();
-    const callbackData = ctx.callbackQuery?.data;
-    if (!callbackData) return;
-
-    const match = callbackData.match(/^enter_amount:(.+)$/);
-    const address = match?.[1];
-    if (!address) return;
-
-    ctx.session.tokenAddress = address;
-    await ctx.reply('Please enter the amount in SOL you want to spend on this token');
-  } catch (error) {
-    logTradeError(error, 'enter_amount');
-    await ctx.reply('An error occurred while processing your request. Please try again.');
+    logDebug('INVALID_INPUT', {
+      text,
+      isNumber: !isNaN(parseFloat(text)),
+      hasTokenAddress: !!ctx.session.tokenAddress,
+      sessionState: ctx.session
+    });
+    
+    await ctx.reply('❌ Invalid input. Please enter a valid token address or amount.', { parse_mode: 'Markdown' });
   }
 });
 
