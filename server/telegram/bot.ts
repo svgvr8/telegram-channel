@@ -890,51 +890,67 @@ bot.command('start', async (ctx) => {
     const startParam = ctx.message?.text?.substring(7);
     const userId = ctx.from?.id.toString();
 
-    // First check if user already has a wallet in session
-    if (!ctx.session.wallet && userId) {
-      // Try to load existing wallet from storage
-      const existingWallet = await session.getSession(`${userId}`);
-      
-      if (existingWallet?.wallet) {
-        ctx.session.wallet = existingWallet.wallet;
-      } else {
-        // Create new wallet only if one doesn't exist
-        const wallet = Keypair.generate();
-        ctx.session.wallet = {
-          publicKey: wallet.publicKey.toString(),
-          secretKey: Buffer.from(wallet.secretKey).toString('hex')
-        };
-        // Save the new wallet
-        await session.saveSession(`${userId}`, ctx.session);
-      }
+    logDebug('START_COMMAND', {
+      startParam,
+      userId,
+      timestamp: new Date().toISOString()
+    });
+
+    // Initialize wallet if needed
+    if (!ctx.session.wallet) {
+      const wallet = Keypair.generate();
+      ctx.session.wallet = {
+        publicKey: wallet.publicKey.toString(),
+        secretKey: Buffer.from(wallet.secretKey).toString('hex')
+      };
     }
 
     if (startParam) {
       const [action, address] = startParam.split('_');
+      
+      logDebug('START_PARAM_PROCESSING', {
+        action,
+        address,
+        sessionState: ctx.session
+      });
+
       if (address && (action === 'buy' || action === 'sell')) {
-        // Only update token address, keep existing wallet
+        // Reset session state for new action
         ctx.session.tokenAddress = address;
-        
-        const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
-        const data = await response.json();
+        ctx.session.tradeAmount = null; // Clear any previous trade amount
+        ctx.session.lastAction = action;
 
-        if (data.pairs && data.pairs.length > 0) {
-          const pair = data.pairs[0];
-          const message = formatTokenInfo(pair, address);
+        logDebug('SESSION_STATE_UPDATED', {
+          newState: ctx.session
+        });
 
-          if (action === 'sell') {
-            await ctx.reply(message, {
-              parse_mode: 'Markdown',
-              reply_markup: getTradeButtons(true, address)
-            });
+        try {
+          const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`);
+          const data = await response.json();
+
+          if (data.pairs && data.pairs.length > 0) {
+            const pair = data.pairs[0];
+            const message = formatTokenInfo(pair, address);
+
+            // For buy links, immediately prompt for amount
+            if (action === 'buy') {
+              await ctx.reply(message, { parse_mode: 'Markdown' });
+              await ctx.reply('💰 Please enter the amount in SOL you want to spend:', { parse_mode: 'Markdown' });
+            } else {
+              await ctx.reply(message, {
+                parse_mode: 'Markdown',
+                reply_markup: getTradeButtons(true, address)
+              });
+            }
           } else {
-            await ctx.reply(message, {
-              parse_mode: 'Markdown',
-              reply_markup: getTradeButtons(false, address)
-            });
+            await ctx.reply(formatTokenNotFoundError(address), { parse_mode: 'Markdown' });
           }
-        } else {
-          await ctx.reply(formatTokenNotFoundError(address), { parse_mode: 'Markdown' });
+        } catch (error) {
+          logDebug('TOKEN_INFO_ERROR', {
+            error: error.message,
+            address
+          });
+          await ctx.reply('❌ Error fetching token information. Please try again.', { parse_mode: 'Markdown' });
         }
       }
     } else {
@@ -945,6 +961,10 @@ bot.command('start', async (ctx) => {
       });
     }
   } catch (error) {
+    logDebug('START_COMMAND_ERROR', {
+      error: error.message,
+      stack: error.stack
+    });
     log(`Error in start command: ${error}`, "telegram");
   }
 });
@@ -964,53 +984,33 @@ bot.action('buy', async (ctx) => {
 
     await ctx.answerCbQuery();
     
-    // Log session state
-    logDebug('SESSION_STATE', {
-      hasWallet: !!ctx.session.wallet,
-      sessionData: ctx.session
+    // Reset the session state for new buy action
+    ctx.session.tokenAddress = null;
+    ctx.session.tradeAmount = null;
+    ctx.session.lastAction = 'buy';
+
+    logDebug('SESSION_RESET_FOR_BUY', {
+      sessionState: ctx.session
     });
 
     if (!ctx.session.wallet) {
-      logDebug('WALLET_MISSING', {
-        creatingNew: true,
-        userId: ctx.from?.id
-      });
-
       const wallet = Keypair.generate();
       ctx.session.wallet = {
         publicKey: wallet.publicKey.toString(),
         secretKey: Buffer.from(wallet.secretKey).toString('hex')
       };
-
-      logDebug('WALLET_CREATED', {
-        publicKey: ctx.session.wallet.publicKey,
-        userId: ctx.from?.id
-      });
     }
 
     const publicKey = new PublicKey(ctx.session.wallet.publicKey);
-    
-    logDebug('CHECKING_BALANCE', {
-      wallet: publicKey.toString(),
-      timestamp: new Date().toISOString()
-    });
-
     const balance = await connection.getBalance(publicKey);
     
-    logDebug('BALANCE_RESULT', {
+    logDebug('BALANCE_CHECK', {
       wallet: publicKey.toString(),
       balanceSOL: balance / LAMPORTS_PER_SOL,
-      balanceLamports: balance,
       timestamp: new Date().toISOString()
     });
 
     if (balance <= 0) {
-      logDebug('INSUFFICIENT_BALANCE', {
-        wallet: publicKey.toString(),
-        balance: balance,
-        minimumRequired: LAMPORTS_PER_SOL * 0.001 // Example minimum
-      });
-
       await ctx.reply(formatInsufficientBalanceMessage(balance, ctx.session.wallet.publicKey),
         { parse_mode: 'Markdown' });
       return;
@@ -1019,32 +1019,17 @@ bot.action('buy', async (ctx) => {
     const message = formatWalletInfo(balance, ctx.session.wallet.publicKey) + `
 📝 Please enter the token contract address to buy`;
 
-    logDebug('PROMPTING_TOKEN_ADDRESS', {
-      wallet: publicKey.toString(),
-      balance: balance / LAMPORTS_PER_SOL,
-      timestamp: new Date().toISOString()
-    });
-
     await ctx.reply(message, { parse_mode: 'Markdown' });
-    ctx.session.lastAction = 'buy';
-
-    logDebug('BUY_ACTION_COMPLETE', {
-      wallet: publicKey.toString(),
-      sessionUpdated: true,
-      lastAction: ctx.session.lastAction
-    });
 
   } catch (error) {
     logDebug('BUY_ACTION_ERROR', {
       error: {
         message: error.message,
-        stack: error.stack,
-        name: error.name
+        stack: error.stack
       },
       sessionState: ctx.session
     });
     
-    log(`Error in buy action: ${error}`, "telegram");
     await ctx.reply('❌ Error checking wallet balance. Please try again - Pump Science Wallet');
   }
 });
@@ -1268,7 +1253,7 @@ bot.action(['sell_50', 'sell_100'], async (ctx) => {
   }
 });
 
-// Text handler with enhanced logging
+// Text handler
 bot.on('text', async (ctx) => {
   const text = ctx.message?.text;
   if (!text) return;
@@ -1276,40 +1261,25 @@ bot.on('text', async (ctx) => {
   logDebug('TEXT_INPUT_RECEIVED', {
     text: text,
     userId: ctx.from?.id,
-    fullSessionState: ctx.session, // Log the entire session
+    fullSessionState: ctx.session,
     timestamp: new Date().toISOString()
   });
 
-  // Amount handling - Check this condition first
-  if (ctx.session.tokenAddress && !isNaN(parseFloat(text))) {
+  // Handle amount input for buy action
+  if (ctx.session.lastAction === 'buy' && ctx.session.tokenAddress && !isNaN(parseFloat(text))) {
     const amount = parseFloat(text);
     
-    logDebug('AMOUNT_INPUT_DETECTED', {
-      inputText: text,
-      parsedAmount: amount,
+    logDebug('PROCESSING_BUY_AMOUNT', {
+      amount,
       tokenAddress: ctx.session.tokenAddress,
       sessionState: ctx.session
     });
 
     try {
-      // Check wallet balance
       const wallet = new PublicKey(ctx.session.wallet.publicKey);
       const balance = await connection.getBalance(wallet);
-      
-      logDebug('CHECKING_BALANCE_FOR_TRADE', {
-        wallet: wallet.toString(),
-        balance: balance / LAMPORTS_PER_SOL,
-        requestedAmount: amount,
-        sufficient: balance >= amount * LAMPORTS_PER_SOL
-      });
 
       if (balance < amount * LAMPORTS_PER_SOL) {
-        logDebug('INSUFFICIENT_BALANCE_FOR_TRADE', {
-          balance: balance / LAMPORTS_PER_SOL,
-          requested: amount,
-          difference: (amount * LAMPORTS_PER_SOL - balance) / LAMPORTS_PER_SOL
-        });
-        
         await ctx.reply(
           formatTradeErrorMessage(balance, amount, ctx.session.wallet.publicKey),
           { parse_mode: 'Markdown' }
@@ -1322,34 +1292,21 @@ bot.on('text', async (ctx) => {
         inputMint: TOKENS.SOL,
         outputMint: ctx.session.tokenAddress,
         amount: (amount * LAMPORTS_PER_SOL).toString(),
-        slippageBps: '100',
-        onlyDirectRoutes: false
+        slippageBps: '100'
       };
 
-      logDebug('REQUESTING_QUOTE', {
-        ...quoteParams,
-        timestamp: new Date().toISOString()
-      });
+      logDebug('REQUESTING_QUOTE', quoteParams);
 
-      // Get quote
       const quote = await getJupiterQuote(quoteParams);
       
       logDebug('QUOTE_RECEIVED', {
         quote,
         inputAmount: amount,
-        outputAmount: Number(quote.outAmount) / 1e9,
-        priceImpact: quote.priceImpactPct
+        outputAmount: Number(quote.outAmount) / 1e9
       });
 
-      // Store trade amount
       ctx.session.tradeAmount = amount;
-      
-      logDebug('TRADE_AMOUNT_STORED', {
-        amount,
-        sessionState: ctx.session
-      });
 
-      // Format confirmation message
       const message = formatTradeSummary(
         amount,
         Number(quote.outAmount) / 1e9,
@@ -1359,12 +1316,6 @@ bot.on('text', async (ctx) => {
         false
       );
 
-      logDebug('SENDING_CONFIRMATION', {
-        message,
-        quoteId: quote.quoteMeta?.id
-      });
-
-      // Send confirmation message
       await ctx.reply(message, {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -1376,42 +1327,31 @@ bot.on('text', async (ctx) => {
       });
 
     } catch (error) {
-      logDebug('TRADE_QUOTE_ERROR', {
-        error: {
-          message: error.message,
-          stack: error.stack
-        },
-        amount,
-        tokenAddress: ctx.session.tokenAddress,
+      logDebug('QUOTE_ERROR', {
+        error: error.message,
         sessionState: ctx.session
       });
-
       await ctx.reply('❌ Error calculating trade quote. Please try again.', { parse_mode: 'Markdown' });
     }
   }
-  // Token address handling
-  else if (!ctx.session.tokenAddress && text.length >= 32 && text.length <= 44) {
+  // Handle token address input (only if we don't have one)
+  else if (ctx.session.lastAction === 'buy' && !ctx.session.tokenAddress && text.length >= 32 && text.length <= 44) {
     try {
-      logDebug('VALIDATING_TOKEN_ADDRESS', {
+      logDebug('PROCESSING_TOKEN_ADDRESS', {
         address: text,
-        timestamp: new Date().toISOString()
+        sessionState: ctx.session
       });
 
       // Validate token address
       try {
         new PublicKey(text);
       } catch (e) {
-        logDebug('INVALID_TOKEN_ADDRESS', {
-          address: text,
-          error: e.message
-        });
         await ctx.reply('❌ Invalid token address. Please enter a valid Solana token address.', { parse_mode: 'Markdown' });
         return;
       }
 
-      // Store token address and request amount
+      // Store token address
       ctx.session.tokenAddress = text;
-      ctx.session.lastAction = 'buy'; // Make sure we set this
       
       logDebug('TOKEN_ADDRESS_STORED', {
         address: text,
@@ -1419,17 +1359,14 @@ bot.on('text', async (ctx) => {
       });
 
       await ctx.reply('💰 Please enter the amount in SOL you want to spend:', { parse_mode: 'Markdown' });
+      return;
     } catch (error) {
-      logDebug('TOKEN_PROCESSING_ERROR', {
-        error: {
-          message: error.message,
-          stack: error.stack
-        },
-        address: text,
-        sessionState: ctx.session
+      logDebug('TOKEN_ADDRESS_ERROR', {
+        error: error.message,
+        address: text
       });
-      
       await ctx.reply('❌ Error processing token address. Please try again.', { parse_mode: 'Markdown' });
+      return;
     }
   } else {
     logDebug('INVALID_INPUT', {
